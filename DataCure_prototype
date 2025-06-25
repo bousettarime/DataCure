@@ -1,0 +1,72 @@
+
+# Importation des bibliothèques
+import streamlit as st
+import pandas as pd
+import openai
+import os
+from dotenv import load_dotenv
+#Chargement de la clé API OpenAI depuis le fichier .env
+load_dotenv()
+openai.api_key = os.getenv("OPENAI_API_KEY")
+# Configuration de la page Streamlit
+st.set_page_config(page_title="Datacure Prototype", layout="wide")
+st.title("Datacure - Assistant de nettoyage de données (v0)")
+
+# Étape 1 : Upload du fichier CSV
+uploaded_file = st.file_uploader("Charge un fichier CSV", type="csv")
+
+# Si un fichier est chargé
+if uploaded_file:
+    # Lecture et affichage du fichier
+    df = pd.read_csv(uploaded_file)
+    st.subheader("Aperçu de la base de données")
+    st.dataframe(df.head())
+
+    # Étape 2 : Commande utilisateur en langage naturel
+    user_input = st.text_input("Que veux-tu faire avec ce fichier ?",
+                               placeholder="Ex : Supprime les lignes où l’âge est manquant")
+
+    # Étape 3 : Envoi au LLM (si l'utilisateur a tapé une commande)
+    if user_input:
+        prompt = f"""
+        Tu es un assistant Python expert en nettoyage de données avec pandas.
+        Voici un DataFrame nommé df.
+        L'utilisateur demande : "{user_input}"
+        Retourne uniquement le code Python (sans commentaires ni texte explicatif) pour effectuer cette opération.
+        """
+
+        with st.spinner("Génération du code Python par GPT..."):
+            try:
+                response = openai.ChatCompletion.create(
+                    model="gpt-4",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0
+                )
+                code = response.choices[0].message.content.strip()
+
+                # ✨ Affiche le code généré
+                st.code(code, language="python")
+
+                # Étape 4 : Bouton pour exécuter le code
+                if st.button("Exécuter ce code sur le fichier"):
+                    try:
+                        # Crée une copie du DataFrame original
+                        local_vars = {"df": df.copy()}
+                        exec(code, {}, local_vars)
+                        df = local_vars["df"]  # mise à jour du df
+                        st.success("Nettoyage appliqué avec succès !")
+                        st.dataframe(df.head())
+                    except Exception as e:
+                        st.error(f"Erreur pendant l’exécution du code : {e}")
+
+            except Exception as e:
+                st.error(f"Erreur dans la génération OpenAI : {e}")
+
+        # Étape 5 : Téléchargement du fichier nettoyé
+        st.markdown("---")
+        st.download_button(
+            "Télécharger le fichier nettoyé",
+            df.to_csv(index=False),
+            "fichier_nettoye.csv",
+            "text/csv"
+        )
