@@ -3,6 +3,7 @@
 # Je construis ici un prototype Streamlit “Data2C / Datacure” :
 # - J'importe un fichier (CSV / Excel / JSON / Stata)
 # - Je propose un bouton “Standardiser le texte” (tout / colonne / ligne)
+# - Je propose des commandes rapides (ex: supprimer lignes avec NA)
 # - Je peux demander à OpenAI de générer du code pandas pour un nettoyage
 # - J'exécute ce code sur une copie du DataFrame et je propose le téléchargement
 # -----------------------------------------------------------------------------
@@ -63,6 +64,7 @@ def _standardize_text_value(
     acronyms: set[str],
     style: str,
 ) -> object:
+    # Je laisse les valeurs manquantes et non-textuelles telles quelles
     if x is None or (isinstance(x, float) and pd.isna(x)):
         return x
     if not isinstance(x, str):
@@ -78,7 +80,7 @@ def _standardize_text_value(
     # Je normalise les espaces
     s = " ".join(s.split())
 
-    # Styles disponibles
+    # J'applique le style demandé
     if style == "Commencer par une majuscule":
         s = s.lower().capitalize()
     elif style == "Tout en MAJUSCULES":
@@ -86,7 +88,7 @@ def _standardize_text_value(
     elif style == "Tout en minuscules":
         s = s.lower()
     else:
-        # Par défaut : Majuscule à chaque mot (Title Case)
+        # Par défaut : Majuscule à chaque mot
         s = s.lower().title()
 
     # Je force les acronymes spécifiés en MAJUSCULES, quel que soit le style
@@ -97,18 +99,6 @@ def _standardize_text_value(
 
     return s
 
-    if remove_accents:
-        s = _remove_accents(s)
-
-    s = " ".join(s.split())
-    s = s.lower().title()
-
-    if acronyms:
-        tokens = s.split(" ")
-        tokens = [t.upper() if t.upper() in acronyms else t for t in tokens]
-        s = " ".join(tokens)
-
-    return s
 
 
 def _text_columns(dataframe: pd.DataFrame) -> list[str]:
@@ -180,6 +170,7 @@ if st.session_state.get("uploaded_name") != uploaded_name:
     st.session_state["file_type"] = file_type_in
     st.session_state["uploaded_name"] = uploaded_name
     st.session_state.pop("generated_code", None)
+    st.session_state.pop("show_std_preview", None)
 
 # Source de vérité
 df = st.session_state["df"]
@@ -261,7 +252,7 @@ with st.expander("🧹 Standardiser le texte", expanded=False):
                     r = selected_row
                     for c in cols_text:
                         df.at[df.index[r], c] = _standardize_text_value(
-                            df.at[df.index[r], c], remove_acc, acronyms
+                            df.at[df.index[r], c], remove_acc, acronyms, style
                         )
 
                 st.session_state["df"] = df
@@ -276,13 +267,12 @@ with st.expander("🧹 Standardiser le texte", expanded=False):
 
     preview_ph = st.empty()
 
-with c3:
-    if st.button("👀 Voir un aperçu", use_container_width=True):
-        st.session_state["show_std_preview"] = True
+    with c3:
+        if st.button("👀 Voir un aperçu", use_container_width=True):
+            st.session_state["show_std_preview"] = True
 
-if st.session_state.get("show_std_preview"):
-    preview_ph.dataframe(st.session_state["df"].head())
-
+    if st.session_state.get("show_std_preview"):
+        preview_ph.dataframe(st.session_state["df"].head())
 
 
 # === Commandes rapides (sans API) ===
@@ -291,7 +281,11 @@ with st.expander("⚡ Commandes rapides", expanded=False):
 
     missing_scope = st.radio(
         "Supprimer les lignes avec valeurs manquantes",
-        ["N'importe quelle colonne (drop si au moins 1 NA)", "Une colonne", "Plusieurs colonnes"],
+        [
+            "N'importe quelle colonne (drop si au moins 1 NA)",
+            "Une colonne",
+            "Plusieurs colonnes",
+        ],
         horizontal=False,
     )
 
@@ -438,4 +432,3 @@ if os.getenv("DATACURE_RUN_TESTS") == "1":
     assert t_jsonl == "json" and df_jsonl.shape == (2, 2)
 
     st.success("✅ DATACURE_RUN_TESTS: tous les mini-tests ont réussi")
-
