@@ -1,18 +1,18 @@
 # datacure_cleaning_app.py
 # -----------------------------------------------------------------------------
 # Je construis ici un prototype Streamlit “Data2C / Datacure” :
-# 1) j’importe un fichier (CSV / Excel / JSON / Stata)
-# 2) je décris en langage naturel un nettoyage à effectuer
-# 3) je demande à l’API OpenAI de générer du code pandas
-# 4) j’exécute ce code sur une copie du DataFrame
-# 5) je propose le téléchargement du résultat
+# - J'importe un fichier (CSV / Excel / JSON / Stata)
+# - Je propose un bouton “Standardiser le texte” (tout / colonne / ligne)
+# - Je peux demander à OpenAI de générer du code pandas pour un nettoyage
+# - J'exécute ce code sur une copie du DataFrame et je propose le téléchargement
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
 
 import io
 import os
-from typing import Tuple, Optional
+import unicodedata
+from typing import Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -20,17 +20,14 @@ from openai import OpenAI
 
 
 # === Configuration Streamlit ===
-# Je configure la page et je pose le titre.
 st.set_page_config(page_title="Datacure Prototype", layout="wide")
 st.title("Datacure - Assistant de nettoyage de données (v0)")
 
 
-# === Chargement de la clé OpenAI ===
-# Je récupère la clé depuis Streamlit secrets (prod) ou une variable d’environnement (dev).
+# === Clé OpenAI ===
 api_key = st.secrets.get("OPENAI_API_KEY") if hasattr(st, "secrets") else None
 api_key = api_key or os.getenv("OPENAI_API_KEY")
 
-# J’instancie le client uniquement si j’ai une clé valide.
 client: Optional[OpenAI] = None
 if not api_key:
     st.warning(
@@ -41,50 +38,70 @@ else:
     client = OpenAI(api_key=api_key)
 
 
-# === Upload fichier multi-formats ===
-# J’accepte CSV, Excel, JSON et Stata.
+# === Upload ===
 uploaded_file = st.file_uploader(
     "Charge un fichier de données",
     type=["csv", "xlsx", "xls", "json", "dta"],
 )
 
 
+def _remove_accents(s: str) -> str:
+    s = unicodedata.normalize("NFKD", s)
+    return "".join(c for c in s if not unicodedata.combining(c))
+
+
+def _standardize_text_value(x, remove_accents: bool, acronyms: set[str]) -> object:
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return x
+    if not isinstance(x, str):
+        return x
+
+    s = x.strip()
+    if not s:
+        return s
+
+    if remove_accents:
+        s = _remove_accents(s)
+
+    s = " ".join(s.split())
+    s = s.lower().title()
+
+    if acronyms:
+        tokens = s.split(" ")
+        tokens = [t.upper() if t.upper() in acronyms else t for t in tokens]
+        s = " ".join(tokens)
+
+    return s
+
+
+def _text_columns(dataframe: pd.DataFrame) -> list[str]:
+    return [
+        c
+        for c in dataframe.columns
+        if dataframe[c].dtype == "object" or str(dataframe[c].dtype) == "string"
+    ]
+
+
 def load_data(file) -> Tuple[pd.DataFrame, str]:
-    """Je charge un fichier Streamlit en DataFrame pandas.
-
-    Je retourne : (df, file_type)
-    - file_type ∈ {"csv", "excel", "json", "stata"}
-
-    Notes:
-    - Pour Excel, je laisse la possibilité de choisir une feuille.
-    - Pour JSON, je tente d’abord une lecture standard, puis JSON Lines si besoin.
-    """
+    """Je charge un fichier uploadé en DataFrame pandas et je retourne (df, file_type)."""
 
     filename = (getattr(file, "name", "") or "").lower().strip()
 
-    # --- CSV ---
     if filename.endswith(".csv"):
-        # Je lis le CSV tel quel.
         df = pd.read_csv(file)
         return df, "csv"
 
-    # --- Excel ---
     if filename.endswith((".xls", ".xlsx")):
-        # Je charge le classeur et je propose à l’utilisateur de choisir la feuille.
         xls = pd.ExcelFile(file)
-        # Par défaut, je sélectionne automatiquement la première feuille (index=0)
         sheet = st.selectbox("Choisis une feuille Excel", xls.sheet_names, index=0)
         df = pd.read_excel(xls, sheet_name=sheet)
         return df, "excel"
 
-    # --- JSON ---
     if filename.endswith(".json"):
-        # Je tente une lecture JSON standard.
         try:
             df = pd.read_json(file)
             return df, "json"
         except ValueError:
-            # Si ça échoue (souvent le cas pour JSON Lines), je réessaie en lines=True.
             try:
                 file.seek(0)
             except Exception:
@@ -92,45 +109,182 @@ def load_data(file) -> Tuple[pd.DataFrame, str]:
             df = pd.read_json(file, lines=True)
             return df, "json"
 
-    # --- Stata (.dta) ---
     if filename.endswith(".dta"):
-        # Je lis le fichier Stata.
         df = pd.read_stata(file)
         return df, "stata"
 
-    # Si le format n’est pas supporté, je lève une erreur claire.
     raise ValueError("Format de fichier non supporté. Utilise CSV, Excel, JSON ou Stata (.dta).")
 
 
-# === UX : si aucun fichier n’est chargé ===
+def _reset_to_uploaded_file() -> None:
+    uploaded_file.seek(0)
+    df0, ft0 = load_data(uploaded_file)
+    st.session_state["df"] = df0
+    st.session_state["file_type"] = ft0
+
+
+# === Pas de fichier ===
 if not uploaded_file:
     st.info("📂 Veuillez charger un fichier (CSV, Excel, JSON ou Stata) pour commencer.")
     st.stop()
 
 
-# === Lecture du fichier ===
+# === Lecture du fichier + session state ===
 try:
-    df, file_type = load_data(uploaded_file)
-    st.subheader("Aperçu du fichier")
-    st.caption(f"📄 Format détecté : {file_type}")
-    st.dataframe(df.head())
+    df_in, file_type_in = load_data(uploaded_file)
 except Exception as e:
     st.error(f"Erreur de lecture du fichier : {e}")
     st.stop()
 
+# Je garde l'état entre reruns
+uploaded_name = getattr(uploaded_file, "name", None)
+if st.session_state.get("uploaded_name") != uploaded_name:
+    st.session_state["df"] = df_in
+    st.session_state["file_type"] = file_type_in
+    st.session_state["uploaded_name"] = uploaded_name
+    st.session_state.pop("generated_code", None)
 
-# === Commande en langage naturel ===
+# Source de vérité
+df = st.session_state["df"]
+file_type = st.session_state.get("file_type", file_type_in)
+
+
+# === Aperçu ===
+st.subheader("Aperçu du fichier")
+st.caption(f"📄 Format détecté : {file_type}")
+st.dataframe(df.head())
+
+
+# === Standardiser le texte (sans API) ===
+with st.expander("🧹 Standardiser le texte", expanded=False):
+    cols_text = _text_columns(df)
+
+    remove_acc = st.checkbox("Supprimer les accents", value=True)
+    acronyms_raw = st.text_input(
+        "Acronymes à garder en MAJ (séparés par des virgules)",
+        value="",
+    )
+    acronyms = {a.strip().upper() for a in acronyms_raw.split(",") if a.strip()}
+
+    scope = st.radio(
+        "Appliquer sur",
+        ["Tout le tableau", "Une colonne", "Une ligne"],
+        horizontal=True,
+    )
+
+    selected_col: Optional[str] = None
+    if scope == "Une colonne":
+        if cols_text:
+            selected_col = st.selectbox("Colonne", cols_text)
+        else:
+            st.info("Aucune colonne texte détectée.")
+
+    selected_row: Optional[int] = None
+    if scope == "Une ligne":
+        selected_row = int(
+            st.number_input(
+                "Index de ligne (0 = première ligne)",
+                min_value=0,
+                max_value=max(0, len(df) - 1),
+                value=0,
+                step=1,
+            )
+        )
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        if st.button("✨ Standardiser", use_container_width=True):
+            if not cols_text:
+                st.warning("Je n'ai trouvé aucune colonne texte à standardiser.")
+            else:
+                if scope == "Tout le tableau":
+                    for c in cols_text:
+                        df[c] = df[c].apply(
+                            lambda v: _standardize_text_value(v, remove_acc, acronyms)
+                        )
+
+                elif scope == "Une colonne" and selected_col:
+                    df[selected_col] = df[selected_col].apply(
+                        lambda v: _standardize_text_value(v, remove_acc, acronyms)
+                    )
+
+                elif scope == "Une ligne" and selected_row is not None:
+                    r = selected_row
+                    for c in cols_text:
+                        df.at[df.index[r], c] = _standardize_text_value(
+                            df.at[df.index[r], c], remove_acc, acronyms
+                        )
+
+                st.session_state["df"] = df
+                st.success("✅ Standardisation appliquée")
+                st.rerun()
+
+    with c2:
+        if st.button("↩️ Annuler les changements", use_container_width=True):
+            _reset_to_uploaded_file()
+            st.success("✅ Réinitialisé")
+            st.rerun()
+
+    with c3:
+        if st.button("👀 Voir un aperçu", use_container_width=True):
+            st.dataframe(st.session_state["df"].head())
+
+
+# === Commandes rapides (sans API) ===
+with st.expander("⚡ Commandes rapides", expanded=False):
+    st.caption("Actions one-click pour nettoyer sans passer par l'API")
+
+    missing_scope = st.radio(
+        "Supprimer les lignes avec valeurs manquantes",
+        ["N'importe quelle colonne (drop si au moins 1 NA)", "Une colonne", "Plusieurs colonnes"],
+        horizontal=False,
+    )
+
+    cols_all = list(df.columns)
+    col_one: Optional[str] = None
+    cols_many: list[str] = []
+
+    if missing_scope == "Une colonne":
+        col_one = st.selectbox("Choisir la colonne", cols_all)
+
+    if missing_scope == "Plusieurs colonnes":
+        cols_many = st.multiselect("Choisir les colonnes", cols_all)
+
+    m1, m2 = st.columns(2)
+
+    with m1:
+        if st.button("🧽 Supprimer les lignes manquantes", use_container_width=True):
+            before = len(df)
+
+            if missing_scope == "N'importe quelle colonne (drop si au moins 1 NA)":
+                df = df.dropna(axis=0, how="any")
+
+            elif missing_scope == "Une colonne" and col_one:
+                df = df.dropna(subset=[col_one], how="any")
+
+            elif missing_scope == "Plusieurs colonnes" and cols_many:
+                df = df.dropna(subset=cols_many, how="any")
+
+            st.session_state["df"] = df
+            removed = before - len(df)
+            st.success(f"✅ {removed} ligne(s) supprimée(s)")
+            st.rerun()
+
+    with m2:
+        if st.button("📊 Compter les valeurs manquantes", use_container_width=True):
+            na_counts = df.isna().sum().sort_values(ascending=False)
+            st.dataframe(na_counts.to_frame(name="NA").T)
+
+
+# === Commande en langage naturel (API) ===
 user_input = st.text_input(
     "Que veux-tu faire avec ce fichier ?",
     placeholder="Ex : Supprime les lignes où la colonne 'age' est manquante",
 )
 
 
-# === Appel OpenAI (génération de code) ===
-# Je n’appelle l’API que si l’utilisateur a écrit une instruction et que j’ai un client.
 if user_input and client:
-    # Je demande explicitement à GPT de renvoyer du code qui modifie df.
-    # IMPORTANT : en prod, exécuter du code généré est risqué. Ici c’est volontairement prototype.
     prompt = f"""
 Tu es un assistant Python expert en nettoyage de données avec pandas.
 Voici un DataFrame nommé df.
@@ -144,32 +298,24 @@ Contraintes:
 - N'utilise pas de réseau.
 """.strip()
 
-    with st.expander("🔍 Voir le prompt envoyé", expanded=False):
-        st.code(prompt)
-
-    # J'utilise des placeholders pour éviter d'afficher du code pendant les phases de chargement/rerun
-    code_container = st.empty()
     result_container = st.empty()
 
-    with st.spinner("🧠 Génération du code Python par GPT..."):
+    # Je n'affiche pas le code pendant le chargement
+    with st.spinner("🧠 Génération du code Python..."):
         try:
             response = client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0,
             )
-
-            # Je stocke le code généré dans le session_state
             st.session_state["generated_code"] = response.choices[0].message.content.strip()
-
         except Exception as e:
-            st.error(f"❌ Erreur lors de l'appel à l'API OpenAI : {e}")
+            result_container.error(f"❌ Erreur lors de l'appel à l'API OpenAI : {e}")
 
-    # Une fois le chargement terminé, je propose de voir le code SANS l'afficher par défaut
     if "generated_code" in st.session_state:
         code = st.session_state["generated_code"]
 
-        # L'utilisateur voit uniquement une action avec un emoji ; aucun code n'est visible par défaut
+        # Rien n'est visible par défaut ; le code est caché derrière un expander avec emoji
         with st.expander("🧠 Voir le code généré", expanded=False):
             st.code(code, language="python")
 
@@ -182,6 +328,7 @@ Contraintes:
                     raise RuntimeError("Le code généré n'a pas laissé de variable 'df' en sortie.")
 
                 df = local_vars["df"]
+                st.session_state["df"] = df
                 result_container.success("✅ Nettoyage appliqué avec succès !")
                 result_container.dataframe(df.head())
 
@@ -189,8 +336,8 @@ Contraintes:
                 result_container.error(f"❌ Erreur pendant l'exécution du code : {e}")
 
 
-# === Téléchargement (CSV par défaut) ===
-# Je propose toujours un export CSV (interopérable partout).
+# === Téléchargement ===
+df = st.session_state.get("df", df)
 cleaned_csv = df.to_csv(index=False).encode("utf-8")
 
 st.download_button(
@@ -201,24 +348,7 @@ st.download_button(
 )
 
 
-# === (Option) Exports alternatifs ===
-# Si je veux activer un export Stata, je peux décommenter ce bloc.
-# Exemple Stata (attention: peut échouer si colonnes non compatibles avec Stata):
-#
-# if file_type == "stata":
-#     buf = io.BytesIO()
-#     df.to_stata(buf, write_index=False)
-#     st.download_button(
-#         label="📥 Télécharger le fichier nettoyé (.dta)",
-#         data=buf.getvalue(),
-#         file_name="fichier_nettoye.dta",
-#         mime="application/octet-stream",
-#     )
-
-
 # === Mini-tests (optionnels) ===
-# Je n’exécute ces tests que si je pose la variable d’environnement DATACURE_RUN_TESTS=1.
-# Ça me permet de valider rapidement la fonction load_data sans perturber Streamlit.
 if os.getenv("DATACURE_RUN_TESTS") == "1":
     import json
 
@@ -234,7 +364,6 @@ if os.getenv("DATACURE_RUN_TESTS") == "1":
             return self._bio.seek(pos)
 
         def __getattr__(self, item):
-            # pandas lit comme un file-like, donc je délègue vers BytesIO
             return getattr(self._bio, item)
 
     # Test CSV
@@ -248,5 +377,10 @@ if os.getenv("DATACURE_RUN_TESTS") == "1":
     df_json, t_json = load_data(fake_json)
     assert t_json == "json" and df_json.shape == (1, 2)
 
-    st.success("✅ DATACURE_RUN_TESTS: tous les mini-tests ont réussi")
+    # Test JSON Lines
+    payload_jsonl = b"{\"a\": 1, \"b\": 2}\n{\"a\": 3, \"b\": 4}\n"
+    fake_jsonl = _FakeUpload("test.json", payload_jsonl)
+    df_jsonl, t_jsonl = load_data(fake_jsonl)
+    assert t_jsonl == "json" and df_jsonl.shape == (2, 2)
 
+    st.success("✅ DATACURE_RUN_TESTS: tous les mini-tests ont réussi")
