@@ -25,8 +25,15 @@ st.title("Datacure - Assistant de nettoyage de données (v0)")
 
 
 # === Clé OpenAI ===
-api_key = st.secrets.get("OPENAI_API_KEY") if hasattr(st, "secrets") else None
-api_key = api_key or os.getenv("OPENAI_API_KEY")
+# Je lis d'abord la variable d'environnement (dev), puis j'essaie Streamlit secrets (prod).
+api_key = os.getenv("OPENAI_API_KEY")
+
+if not api_key:
+    try:
+        api_key = st.secrets.get("OPENAI_API_KEY")
+    except Exception:
+        # Si aucun secrets.toml n'existe (local), Streamlit peut lever StreamlitSecretNotFoundError.
+        api_key = None
 
 client: Optional[OpenAI] = None
 if not api_key:
@@ -50,7 +57,12 @@ def _remove_accents(s: str) -> str:
     return "".join(c for c in s if not unicodedata.combining(c))
 
 
-def _standardize_text_value(x, remove_accents: bool, acronyms: set[str]) -> object:
+def _standardize_text_value(
+    x,
+    remove_accents: bool,
+    acronyms: set[str],
+    style: str,
+) -> object:
     if x is None or (isinstance(x, float) and pd.isna(x)):
         return x
     if not isinstance(x, str):
@@ -59,6 +71,31 @@ def _standardize_text_value(x, remove_accents: bool, acronyms: set[str]) -> obje
     s = x.strip()
     if not s:
         return s
+
+    if remove_accents:
+        s = _remove_accents(s)
+
+    # Je normalise les espaces
+    s = " ".join(s.split())
+
+    # Styles disponibles
+    if style == "Commencer par une majuscule":
+        s = s.lower().capitalize()
+    elif style == "Tout en MAJUSCULES":
+        s = s.upper()
+    elif style == "Tout en minuscules":
+        s = s.lower()
+    else:
+        # Par défaut : Majuscule à chaque mot (Title Case)
+        s = s.lower().title()
+
+    # Je force les acronymes spécifiés en MAJUSCULES, quel que soit le style
+    if acronyms:
+        tokens = s.split(" ")
+        tokens = [t.upper() if t.upper() in acronyms else t for t in tokens]
+        s = " ".join(tokens)
+
+    return s
 
     if remove_accents:
         s = _remove_accents(s)
@@ -159,6 +196,17 @@ st.dataframe(df.head())
 with st.expander("🧹 Standardiser le texte", expanded=False):
     cols_text = _text_columns(df)
 
+    style = st.selectbox(
+        "Style",
+        [
+            "Majuscule à chaque mot",
+            "Commencer par une majuscule",
+            "Tout en MAJUSCULES",
+            "Tout en minuscules",
+        ],
+        index=0,
+    )
+
     remove_acc = st.checkbox("Supprimer les accents", value=True)
     acronyms_raw = st.text_input(
         "Acronymes à garder en MAJ (séparés par des virgules)",
@@ -201,12 +249,12 @@ with st.expander("🧹 Standardiser le texte", expanded=False):
                 if scope == "Tout le tableau":
                     for c in cols_text:
                         df[c] = df[c].apply(
-                            lambda v: _standardize_text_value(v, remove_acc, acronyms)
+                            lambda v: _standardize_text_value(v, remove_acc, acronyms, style)
                         )
 
                 elif scope == "Une colonne" and selected_col:
                     df[selected_col] = df[selected_col].apply(
-                        lambda v: _standardize_text_value(v, remove_acc, acronyms)
+                        lambda v: _standardize_text_value(v, remove_acc, acronyms, style)
                     )
 
                 elif scope == "Une ligne" and selected_row is not None:
@@ -384,3 +432,4 @@ if os.getenv("DATACURE_RUN_TESTS") == "1":
     assert t_jsonl == "json" and df_jsonl.shape == (2, 2)
 
     st.success("✅ DATACURE_RUN_TESTS: tous les mini-tests ont réussi")
+
