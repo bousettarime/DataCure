@@ -274,9 +274,15 @@ with st.expander("🧹 Standardiser le texte", expanded=False):
             st.success("✅ Réinitialisé")
             st.rerun()
 
-    with c3:
-        if st.button("👀 Voir un aperçu", use_container_width=True):
-            st.dataframe(st.session_state["df"].head())
+    preview_ph = st.empty()
+
+with c3:
+    if st.button("👀 Voir un aperçu", use_container_width=True):
+        st.session_state["show_std_preview"] = True
+
+if st.session_state.get("show_std_preview"):
+    preview_ph.dataframe(st.session_state["df"].head())
+
 
 
 # === Commandes rapides (sans API) ===
