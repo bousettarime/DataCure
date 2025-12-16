@@ -8,14 +8,19 @@
 # 5) je propose le téléchargement du résultat
 # -----------------------------------------------------------------------------
 
-import os
+from __future__ import annotations
+
 import io
-import streamlit as st
+import os
+from typing import Tuple, Optional
+
 import pandas as pd
+import streamlit as st
 from openai import OpenAI
 
 
 # === Configuration Streamlit ===
+# Je configure la page et je pose le titre.
 st.set_page_config(page_title="Datacure Prototype", layout="wide")
 st.title("Datacure - Assistant de nettoyage de données (v0)")
 
@@ -26,7 +31,7 @@ api_key = st.secrets.get("OPENAI_API_KEY") if hasattr(st, "secrets") else None
 api_key = api_key or os.getenv("OPENAI_API_KEY")
 
 # J’instancie le client uniquement si j’ai une clé valide.
-client = None
+client: Optional[OpenAI] = None
 if not api_key:
     st.warning(
         "⚠️ Clé API OpenAI manquante. Configure-la dans .streamlit/secrets.toml "
@@ -44,7 +49,7 @@ uploaded_file = st.file_uploader(
 )
 
 
-def load_data(file: "st.runtime.uploaded_file_manager.UploadedFile") -> tuple[pd.DataFrame, str]:
+def load_data(file) -> Tuple[pd.DataFrame, str]:
     """Je charge un fichier Streamlit en DataFrame pandas.
 
     Je retourne : (df, file_type)
@@ -52,15 +57,14 @@ def load_data(file: "st.runtime.uploaded_file_manager.UploadedFile") -> tuple[pd
 
     Notes:
     - Pour Excel, je laisse la possibilité de choisir une feuille.
-    - Pour JSON, je tente d’abord une lecture standard, puis une lecture JSON Lines si besoin.
+    - Pour JSON, je tente d’abord une lecture standard, puis JSON Lines si besoin.
     """
 
-    filename = (file.name or "").lower().strip()
+    filename = (getattr(file, "name", "") or "").lower().strip()
 
     # --- CSV ---
     if filename.endswith(".csv"):
-        # Je lis le CSV tel quel (pandas gère automatiquement la plupart des séparateurs standards,
-        # mais si tu as beaucoup de fichiers avec ;, on pourra ajouter un détecteur de sep).
+        # Je lis le CSV tel quel.
         df = pd.read_csv(file)
         return df, "csv"
 
@@ -68,7 +72,8 @@ def load_data(file: "st.runtime.uploaded_file_manager.UploadedFile") -> tuple[pd
     if filename.endswith((".xls", ".xlsx")):
         # Je charge le classeur et je propose à l’utilisateur de choisir la feuille.
         xls = pd.ExcelFile(file)
-        sheet = st.selectbox("Choisis une feuille Excel", xls.sheet_names)
+        # Par défaut, je sélectionne automatiquement la première feuille (index=0)
+        sheet = st.selectbox("Choisis une feuille Excel", xls.sheet_names, index=0)
         df = pd.read_excel(xls, sheet_name=sheet)
         return df, "excel"
 
@@ -80,8 +85,10 @@ def load_data(file: "st.runtime.uploaded_file_manager.UploadedFile") -> tuple[pd
             return df, "json"
         except ValueError:
             # Si ça échoue (souvent le cas pour JSON Lines), je réessaie en lines=True.
-            # Je dois remettre le curseur au début, sinon pandas lit “vide”.
-            file.seek(0)
+            try:
+                file.seek(0)
+            except Exception:
+                pass
             df = pd.read_json(file, lines=True)
             return df, "json"
 
@@ -140,49 +147,50 @@ Contraintes:
     with st.expander("🔍 Voir le prompt envoyé", expanded=False):
         st.code(prompt)
 
+    # J'utilise des placeholders pour éviter d'afficher du code pendant les phases de chargement/rerun
+    code_container = st.empty()
+    result_container = st.empty()
+
     with st.spinner("🧠 Génération du code Python par GPT..."):
         try:
-            # Note: tu peux remplacer gpt-3.5-turbo par un modèle plus récent.
             response = client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0,
             )
 
-            code = response.choices[0].message.content.strip()
-
-            st.subheader("💡 Code généré")
-            st.code(code, language="python")
-
-            # Bouton d’exécution
-            if st.button("▶️ Exécuter ce code sur le DataFrame"):
-                try:
-                    # J’exécute sur une copie pour éviter de casser df si le code plante.
-                    local_vars = {"df": df.copy()}
-
-                    # Je fournis un namespace global vide ({}), et un locals contrôlé.
-                    # Attention : cela n’est pas une sandbox de sécurité.
-                    exec(code, {}, local_vars)
-
-                    # Je récupère df modifié.
-                    if "df" not in local_vars:
-                        raise RuntimeError("Le code généré n'a pas laissé de variable 'df' en sortie.")
-
-                    df = local_vars["df"]
-
-                    st.success("✅ Nettoyage appliqué avec succès !")
-                    st.dataframe(df.head())
-
-                except Exception as e:
-                    st.error(f"❌ Erreur pendant l'exécution du code : {e}")
+            # Je stocke le code généré dans le session_state
+            st.session_state["generated_code"] = response.choices[0].message.content.strip()
 
         except Exception as e:
             st.error(f"❌ Erreur lors de l'appel à l'API OpenAI : {e}")
 
+    # Une fois le chargement terminé, je propose de voir le code SANS l'afficher par défaut
+    if "generated_code" in st.session_state:
+        code = st.session_state["generated_code"]
+
+        # L'utilisateur voit uniquement une action avec un emoji ; aucun code n'est visible par défaut
+        with st.expander("🧠 Voir le code généré", expanded=False):
+            st.code(code, language="python")
+
+        if st.button("▶️ Exécuter ce nettoyage"):
+            try:
+                local_vars = {"df": df.copy()}
+                exec(code, {}, local_vars)
+
+                if "df" not in local_vars:
+                    raise RuntimeError("Le code généré n'a pas laissé de variable 'df' en sortie.")
+
+                df = local_vars["df"]
+                result_container.success("✅ Nettoyage appliqué avec succès !")
+                result_container.dataframe(df.head())
+
+            except Exception as e:
+                result_container.error(f"❌ Erreur pendant l'exécution du code : {e}")
+
 
 # === Téléchargement (CSV par défaut) ===
 # Je propose toujours un export CSV (interopérable partout).
-# Si tu veux, je peux aussi ajouter des exports conditionnels Excel/Stata.
 cleaned_csv = df.to_csv(index=False).encode("utf-8")
 
 st.download_button(
@@ -194,7 +202,7 @@ st.download_button(
 
 
 # === (Option) Exports alternatifs ===
-# Si tu veux activer un export Stata/Excel, je peux te l’ajouter proprement ici.
+# Si je veux activer un export Stata, je peux décommenter ce bloc.
 # Exemple Stata (attention: peut échouer si colonnes non compatibles avec Stata):
 #
 # if file_type == "stata":
@@ -206,6 +214,39 @@ st.download_button(
 #         file_name="fichier_nettoye.dta",
 #         mime="application/octet-stream",
 #     )
-"}
 
+
+# === Mini-tests (optionnels) ===
+# Je n’exécute ces tests que si je pose la variable d’environnement DATACURE_RUN_TESTS=1.
+# Ça me permet de valider rapidement la fonction load_data sans perturber Streamlit.
+if os.getenv("DATACURE_RUN_TESTS") == "1":
+    import json
+
+    class _FakeUpload:
+        def __init__(self, name: str, payload: bytes):
+            self.name = name
+            self._bio = io.BytesIO(payload)
+
+        def read(self, *args, **kwargs):
+            return self._bio.read(*args, **kwargs)
+
+        def seek(self, pos: int):
+            return self._bio.seek(pos)
+
+        def __getattr__(self, item):
+            # pandas lit comme un file-like, donc je délègue vers BytesIO
+            return getattr(self._bio, item)
+
+    # Test CSV
+    fake_csv = _FakeUpload("test.csv", b"a,b\n1,2\n")
+    df_csv, t_csv = load_data(fake_csv)
+    assert t_csv == "csv" and df_csv.shape == (1, 2)
+
+    # Test JSON records
+    payload = json.dumps([{"a": 1, "b": 2}]).encode("utf-8")
+    fake_json = _FakeUpload("test.json", payload)
+    df_json, t_json = load_data(fake_json)
+    assert t_json == "json" and df_json.shape == (1, 2)
+
+    st.success("✅ DATACURE_RUN_TESTS: tous les mini-tests ont réussi")
 
