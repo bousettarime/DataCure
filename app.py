@@ -448,21 +448,48 @@ mode = st.radio(
 with st.expander("🏷️ Labellisation des variables (Catégorielle vs Continue)", expanded=False):
     st.caption("Force le type pour les variables numériques catégorielles (ou toute variable).")
 
-    # candidats (tu peux changer la règle si tu veux inclure toutes les colonnes)
+    # candidats (numériques uniquement)
     candidates = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
 
     if not candidates:
         st.info("Aucune colonne numérique détectée.")
     else:
+        # ✅ on travaille en strings partout pour éviter les mismatches
+        options = [str(c) for c in candidates]
+
         cols = st.multiselect(
             "Sélectionne les colonnes à typer",
-            options=[str(c) for c in candidates],
+            options=options,
             default=[],
             key="type_cols_select",
         )
 
+        # ✅ Batch apply
+        batch_value = st.selectbox(
+            "Appliquer à toutes les colonnes sélectionnées",
+            ["—", "Auto (détection)", "Catégorielle", "Continue"],
+            index=0,
+            key="type_batch_value",
+        )
+
+        if st.button("⚡ Appliquer à toutes", use_container_width=True, key="type_batch_apply"):
+            if batch_value != "—":
+                for col in cols:
+                    # met aussi à jour les selectbox individuels
+                    st.session_state[f"type_override__{col}"] = batch_value
+
+                    # met à jour le stockage
+                    if batch_value == "Auto (détection)":
+                        st.session_state["type_overrides"].pop(col, None)
+                    else:
+                        st.session_state["type_overrides"][col] = batch_value
+
+                st.success("✅ Type appliqué à toutes les colonnes sélectionnées.")
+                st.rerun()
+
+        # Réglage fin (optionnel) colonne par colonne
         for col in cols:
-            current = st.session_state["type_overrides"].get(col, "Auto (détection)")
+            current = st.session_state.get("type_overrides", {}).get(col, "Auto (détection)")
             st.selectbox(
                 f"{col}",
                 ["Auto (détection)", "Catégorielle", "Continue"],
@@ -487,6 +514,7 @@ with st.expander("🏷️ Labellisation des variables (Catégorielle vs Continue
                 st.session_state["type_overrides"] = {}
                 st.success("Overrides supprimés.")
                 st.rerun()
+
 
 # ================================
 # 🧭 MODE MÉTHODOLOGIQUE (simple)
@@ -646,7 +674,7 @@ if mode == "🧭 Nettoyage méthodologique":
         st.divider()
 
         # --- 2) Valeurs manquantes (par variable) ---
-        st.markdown("### 2) 🟡 Valeurs manquantes (par variable)")
+        st.markdown("### 2) Valeurs manquantes (par variable)")
 
         n_rows = len(df)
         miss = df.isna().sum().astype(int)
@@ -1098,3 +1126,4 @@ if os.getenv("DATACURE_RUN_TESTS") == "1":
     assert _detect_special_codes(s)[0][0] == "99"
 
     st.success("✅ DATACURE_RUN_TESTS: tous les mini-tests ont réussi")
+
