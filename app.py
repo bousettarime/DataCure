@@ -154,10 +154,102 @@ def _log_event(**kwargs) -> None:
     )
 
 
-def _infer_semantic_type(s: pd.Series) -> str:
-    """Heuristique légère : bool/catégorielle ; num avec peu de modalités => catégorielle sinon continue."""
-    if s.dtype == "bool":
+def _is_id_like(name: str) -> bool:
+    n = (name or "").strip().lower()
+    # indices très fréquents d'identifiants/codes (à étendre si besoin)
+    return any(
+        k in n
+        for k in [
+            " id",
+            "_id",
+            "id_",
+            "ident",
+            "identifier",
+            "code",
+            "zipcode",
+            "zip",
+            "postal",
+            "post",
+            "phone",
+            "tel",
+            "ssn",
+            "nr",
+            "num",
+        ]
+    )
+
+
+def _coerce_numeric_if_possible(s: pd.Series, min_convert_rate: float = 0.9) -> Optional[pd.Series]:
+    """Si une série objet/string est majoritairement numérique, renvoie une version float, sinon None."""
+    if pd.api.types.is_numeric_dtype(s) or pd.api.types.is_bool_dtype(s) or pd.api.types.is_datetime64_any_dtype(s):
+        return None
+
+    # tentative sur une copie string
+    s_str = s.astype("string")
+    s_num = pd.to_numeric(s_str, errors="coerce")
+    n = int(s.notna().sum())
+    if n == 0:
+        return None
+
+    ok = int(s_num.notna().sum())
+    if (ok / n) >= min_convert_rate:
+        return s_num
+    return None
+
+
+def _infer_semantic_type(s: pd.Series, col_name: str = "") -> str:
+    """Heuristique robuste :
+    - bool/categorical -> Catégorielle
+    - datetime -> Continue
+    - objet/string "numérique" -> évalué comme numérique
+    - numérique : peu de modalités => Catégorielle, sinon Continue
+    - règle spéciale : colonnes id-like => Catégorielle
+    """
+
+    if pd.api.types.is_bool_dtype(s) or str(s.dtype) == "bool":
         return "Catégorielle"
+
+    if pd.api.types.is_categorical_dtype(s):
+        return "Catégorielle"
+
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return "Continue"
+
+    # Si la colonne ressemble à un identifiant/codage, on force plutôt "Catégorielle"
+    # (même si elle est numérique et très distincte)
+    if _is_id_like(col_name):
+        return "Catégorielle"
+
+    # Si c'est du texte mais fortement convertible en numérique
+    s_num = _coerce_numeric_if_possible(s)
+    if s_num is not None:
+        s = s_num
+
+    if pd.api.types.is_numeric_dtype(s):
+        s2 = s.dropna()
+        n = int(s2.shape[0])
+        if n == 0:
+            return "Continue"
+
+        nunique = int(s2.nunique(dropna=True))
+
+        # Beaucoup de datasets encodent des catégories en int (0/1/2/...) :
+        # - peu de modalités
+        # - ou proportion faible de modalités
+        if nunique <= 20:
+            return "Catégorielle"
+
+        if (nunique / max(n, 1)) <= 0.05:
+            return "Catégorielle"
+
+        # entiers avec "pas trop" de modalités (ex: échelles 0–100, scores discrets)
+        # → on classe souvent comme catégoriel s'il y a relativement peu de valeurs distinctes.
+        if pd.api.types.is_integer_dtype(s) and nunique <= 200 and (nunique / max(n, 1)) <= 0.20:
+            return "Catégorielle"
+
+        return "Continue"
+
+    return "Catégorielle"
 
     if pd.api.types.is_numeric_dtype(s):
         nunique = int(s.nunique(dropna=True))
@@ -241,7 +333,7 @@ def _col_profile(df_: pd.DataFrame, col: str) -> dict:
     na = int(s.isna().sum())
     nunique = int(s.nunique(dropna=True))
 
-    semantic = _infer_semantic_type(s)
+    semantic = _infer_semantic_type(s, col)
 
     profile = {
         "column": col,
