@@ -7,7 +7,7 @@
 # - Nettoyage simple (méthodologique) : standardisation texte + NA par variable (validation bouton)
 # - Q&A dataset (principalement déterministe)
 # - Option IA : générer code pandas de nettoyage (mode libre)
-# - Export CSV + (optionnel) codebook PDF
+# - Export CSV + codebook Excel (remplace le PDF)
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -22,18 +22,15 @@ import pandas as pd
 import streamlit as st
 from openai import OpenAI
 
-
-# === PDF (optionnel) ===
+# === Excel codebook (optionnel) ===
 try:
-    from reportlab.lib import colors
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.styles import getSampleStyleSheet
-    from reportlab.lib.units import cm
-    from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    import openpyxl
+    from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+    from openpyxl.utils import get_column_letter
 
-    _HAS_REPORTLAB = True
+    _HAS_OPENPYXL = True
 except Exception:
-    _HAS_REPORTLAB = False
+    _HAS_OPENPYXL = False
 
 
 # === Streamlit ===
@@ -118,12 +115,7 @@ def load_data(file) -> Tuple[pd.DataFrame, str]:
         return pd.read_csv(file), "csv"
 
     if filename.endswith((".xls", ".xlsx")):
-        try:
-            xls = pd.ExcelFile(file)
-        except ImportError as e:
-            raise ImportError(
-                "Missing optional dependency 'openpyxl'. Installe-le avec: pip install openpyxl"
-            ) from e
+        xls = pd.ExcelFile(file)  # openpyxl est utilisé par pandas si dispo
         sheet = st.selectbox("Choisis une feuille Excel", xls.sheet_names, index=0)
         return pd.read_excel(xls, sheet_name=sheet), "excel"
 
@@ -163,6 +155,7 @@ def _log_event(**kwargs) -> None:
 
 
 def _infer_semantic_type(s: pd.Series) -> str:
+    """Heuristique légère : bool/catégorielle ; num avec peu de modalités => catégorielle sinon continue."""
     if s.dtype == "bool":
         return "Catégorielle"
 
@@ -171,19 +164,18 @@ def _infer_semantic_type(s: pd.Series) -> str:
         n = int(s.notna().sum())
         if n == 0:
             return "Continue"
-
         if nunique <= 12:
             return "Catégorielle"
-
         if (nunique / max(n, 1)) <= 0.05:
             return "Catégorielle"
-
         return "Continue"
 
     return "Catégorielle"
 
 
 def _detect_special_codes(s: pd.Series) -> list[tuple[str, int]]:
+    """Retourne jusqu'à 6 codes spéciaux détectés sous forme [(val, count), ...]."""
+
     candidates = {
         -9,
         -8,
@@ -196,11 +188,10 @@ def _detect_special_codes(s: pd.Series) -> list[tuple[str, int]]:
         -1,
         88,
         99,
+        777,
         888,
         999,
         9999,
-        777,
-        666,
     }
 
     out: list[tuple[str, int]] = []
@@ -216,9 +207,10 @@ def _detect_special_codes(s: pd.Series) -> list[tuple[str, int]]:
                 "NA",
                 "N/A",
                 "NULL",
-                "null",
-                "Unknown",
-                "unknown",
+                "NONE",
+                "MISSING",
+                "UNK",
+                "UNKNOWN",
                 "-9",
                 "-4",
                 "99",
@@ -269,7 +261,9 @@ def _col_profile(df_: pd.DataFrame, col: str) -> dict:
     profile["examples"] = _truncate(", ".join(top_vals), 70)
 
     specials = _detect_special_codes(s)
-    profile["special_codes"] = _truncate(", ".join([f"{v} (n={c})" for v, c in specials]), 60) if specials else ""
+    profile["special_codes"] = (
+        _truncate(", ".join([f"{v} (n={c})" for v, c in specials]), 60) if specials else "—"
+    )
 
     if semantic == "Continue" and pd.api.types.is_numeric_dtype(s) and s.notna().any():
         profile["min"] = float(s.min(skipna=True))
@@ -282,116 +276,119 @@ def _col_profile(df_: pd.DataFrame, col: str) -> dict:
     return profile
 
 
-def _make_codebook_pdf(df_: pd.DataFrame, dataset_name: str) -> bytes:
-    if not _HAS_REPORTLAB:
-        raise ModuleNotFoundError("reportlab")
+def _make_codebook_excel(df_: pd.DataFrame, dataset_name: str) -> bytes:
+    """Génère un codebook Excel lisible, colonnes auto-ajustées, et codes spéciaux détectés."""
+    if not _HAS_OPENPYXL:
+        raise ModuleNotFoundError("openpyxl")
 
-    styles = getSampleStyleSheet()
-    story = [Paragraph(dataset_name, styles["Title"]), Spacer(1, 0.3 * cm)]
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Codebook"
 
-    n_rows, n_cols = df_.shape
-    summary_tbl = Table(
-        [["Lignes", f"{n_rows:,}"], ["Colonnes", f"{n_cols:,}"]],
-        colWidths=[5 * cm, 10 * cm],
+    # Styles
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    cell_alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+    thin_border = Border(
+        left=Side(style="thin"),
+        right=Side(style="thin"),
+        top=Side(style="thin"),
+        bottom=Side(style="thin"),
     )
-    summary_tbl.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
-                ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
-                ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
-                ("FONTSIZE", (0, 0), (-1, -1), 9),
-            ]
-        )
-    )
-    story += [
-        summary_tbl,
-        Spacer(1, 0.4 * cm),
-        Paragraph("Dictionnaire des variables", styles["Heading2"]),
-        Spacer(1, 0.2 * cm),
-    ]
 
-    header = [
+    # Titre (sur 11 colonnes)
+    ws.merge_cells("A1:K1")
+    title_cell = ws["A1"]
+    title_cell.value = dataset_name
+    title_cell.font = Font(bold=True, size=16)
+    title_cell.alignment = Alignment(horizontal="center")
+
+    # Infos générales
+    ws["A3"] = f"Nombre de lignes: {len(df_):,}"
+    ws["A4"] = f"Nombre de colonnes: {len(df_.columns):,}"
+
+    headers = [
+        "#",
         "Variable",
-        "Type (analyse)",
-        "Manquants",
-        "%",
-        "Uniques",
-        "Codes spéciaux",
+        "Type",
+        "Non-null",
+        "Null (%)",
+        "Unique",
         "Exemples (top 5)",
+        "Codes spéciaux détectés",
         "Min",
         "Max",
-        "Moy.",
-        "Med.",
+        "Moy./Med.",
     ]
 
-    def _table(rows_):
-        tbl = Table(
-            rows_,
-            colWidths=[
-                3.6 * cm,
-                2.2 * cm,
-                1.5 * cm,
-                1.1 * cm,
-                1.3 * cm,
-                2.6 * cm,
-                5.4 * cm,
-                1.1 * cm,
-                1.1 * cm,
-                1.1 * cm,
-                1.1 * cm,
-            ],
-            repeatRows=1,
-        )
-        tbl.setStyle(
-            TableStyle(
-                [
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-                    ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
-                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                    ("FONTSIZE", (0, 0), (-1, -1), 8),
-                ]
-            )
-        )
-        return tbl
+    start_row = 6
 
-    rows = [header]
+    # En-têtes
+    for col_idx, header in enumerate(headers, 1):
+        cell = ws.cell(row=start_row, column=col_idx, value=header)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = header_alignment
+        cell.border = thin_border
+
+    # Figer l'entête + filtre
+    ws.freeze_panes = ws[f"A{start_row+1}"]
+    ws.auto_filter.ref = f"A{start_row}:K{start_row}"
+
+    # Lignes
     for i, col in enumerate(df_.columns, start=1):
         p = _col_profile(df_, str(col))
-        rows.append(
-            [
-                p["column"],
-                p["type"],
-                str(p["missing"]),
-                str(p["missing_pct"]),
-                str(p["unique"]),
-                p["special_codes"],
-                p["examples"],
-                "" if p["min"] is None else f"{p['min']:.4g}",
-                "" if p["max"] is None else f"{p['max']:.4g}",
-                "" if p["mean"] is None else f"{p['mean']:.4g}",
-                "" if p["median"] is None else f"{p['median']:.4g}",
-            ]
-        )
-        if i % 25 == 0:
-            story.append(_table(rows))
-            story.append(PageBreak())
-            rows = [header]
+        row_idx = start_row + i
 
-    if len(rows) > 1:
-        story.append(_table(rows))
+        non_null = int(df_[col].notna().sum())
+        null_pct = float((df_[col].isna().sum() / len(df_) * 100) if len(df_) else 0.0)
 
+        # Moy./Med. uniquement si continue
+        mm = "—"
+        if p["mean"] is not None and p["median"] is not None:
+            mm = f"mean={p['mean']:.4g}; med={p['median']:.4g}"
+
+        row_data = [
+            i,
+            p["column"],
+            p["type"],
+            non_null,
+            f"{null_pct:.2f}%",
+            p["unique"],
+            p["examples"],
+            p["special_codes"],
+            "" if p["min"] is None else f"{p['min']:.4g}",
+            "" if p["max"] is None else f"{p['max']:.4g}",
+            mm,
+        ]
+
+        for col_idx, value in enumerate(row_data, 1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            cell.alignment = cell_alignment
+            cell.border = thin_border
+
+            # Mise en évidence si codes spéciaux détectés
+            if col_idx == 8 and isinstance(value, str) and value not in ("", "—"):
+                cell.fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+
+    # Auto-ajustement des largeurs (sans se faire biaiser par le titre et A3/A4)
+    for col_idx in range(1, len(headers) + 1):
+        max_length = 0
+        col_letter = get_column_letter(col_idx)
+
+        for row in range(start_row, ws.max_row + 1):
+            v = ws.cell(row=row, column=col_idx).value
+            if v is None:
+                continue
+            max_length = max(max_length, len(str(v)))
+
+        ws.column_dimensions[col_letter].width = min(max(max_length + 2, 10), 60)
+
+    # Sauvegarde buffer
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(
-        buf,
-        pagesize=A4,
-        leftMargin=1.2 * cm,
-        rightMargin=1.2 * cm,
-        topMargin=1.2 * cm,
-        bottomMargin=1.2 * cm,
-        title=dataset_name,
-    )
-    doc.build(story)
+    wb.save(buf)
+    buf.seek(0)
     return buf.getvalue()
 
 
@@ -966,29 +963,32 @@ Contraintes:
                     result_container.error(f"❌ Erreur pendant l'exécution : {e}")
 
 
-# === Codebook PDF (optionnel) ===
-with st.expander("📄 Codebook (PDF)", expanded=False):
-    if not _HAS_REPORTLAB:
-        st.info("PDF indisponible : installe reportlab (pip install reportlab).")
+# === Codebook Excel ===
+with st.expander("📊 Codebook (Excel)", expanded=False):
+    if not _HAS_OPENPYXL:
+        st.info("Excel indisponible : installe openpyxl (pip install openpyxl).")
     else:
         default_name = st.session_state.get("uploaded_name") or "dataset"
-        pdf_title = st.text_input(
+        excel_title = st.text_input(
             "Titre du codebook",
             value=f"Codebook - {default_name}",
-            key="pdf_title",
+            key="excel_title",
         )
-        if st.button("📄 Générer le PDF", use_container_width=True, key="pdf_btn"):
+        if st.button("📊 Générer le codebook Excel", use_container_width=True, key="excel_btn"):
             try:
-                with st.spinner("Génération du codebook PDF..."):
-                    pdf_bytes = _make_codebook_pdf(st.session_state["df"], dataset_name=pdf_title)
+                with st.spinner("Génération du codebook Excel..."):
+                    excel_bytes = _make_codebook_excel(st.session_state["df"], dataset_name=excel_title)
+
                 st.download_button(
-                    label="⬇️ Télécharger le codebook (PDF)",
-                    data=pdf_bytes,
-                    file_name="codebook.pdf",
-                    mime="application/pdf",
+                    label="⬇️ Télécharger le codebook (Excel)",
+                    data=excel_bytes,
+                    file_name=f"{default_name}_codebook.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
                 )
+                st.success("✅ Codebook Excel généré")
             except Exception as e:
-                st.error(f"Erreur PDF : {e}")
+                st.error(f"Erreur Excel : {e}")
 
 
 # === Export CSV ===
@@ -1025,7 +1025,7 @@ if os.getenv("DATACURE_RUN_TESTS") == "1":
     df_csv, t_csv = load_data(fake_csv)
     assert t_csv == "csv" and df_csv.shape == (1, 2)
 
-    payload = json.dumps([{ "a": 1, "b": 2 }]).encode("utf-8")
+    payload = json.dumps([{"a": 1, "b": 2}]).encode("utf-8")
     fake_json = _FakeUpload("test.json", payload)
     df_json, t_json = load_data(fake_json)
     assert t_json == "json" and df_json.shape == (1, 2)
@@ -1046,3 +1046,4 @@ if os.getenv("DATACURE_RUN_TESTS") == "1":
     assert _detect_special_codes(s)[0][0] == "99"
 
     st.success("✅ DATACURE_RUN_TESTS: tous les mini-tests ont réussi")
+
