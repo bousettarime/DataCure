@@ -183,6 +183,113 @@ st.caption(f"📄 Format détecté : {file_type}")
 st.dataframe(df.head())
 
 
+# === Questions sur les données (sans modifier df) ===
+with st.expander("💬 Poser une question sur le dataset", expanded=False):
+    q = st.text_input(
+        "Question",
+        placeholder="Ex : Combien de lignes ? Y a-t-il des doublons d'identifiant ?",
+    )
+
+    id_candidates = list(df.columns)
+    id_col = st.selectbox("Colonne identifiant (si besoin)", id_candidates)
+
+    qa_out = st.empty()
+
+    def _answer_question(question: str) -> None:
+        qq = (question or "").strip().lower()
+        if not qq:
+            qa_out.info("Écris une question ci-dessus.")
+            return
+
+        # Dimensions
+        if "combien" in qq and ("ligne" in qq or "rows" in qq):
+            qa_out.success(f"Il y a {len(df):,} ligne(s).")
+            return
+        if "combien" in qq and ("colonne" in qq or "columns" in qq):
+            qa_out.success(f"Il y a {df.shape[1]:,} colonne(s).")
+            return
+        if "dimension" in qq or "shape" in qq:
+            qa_out.success(
+                f"Dimensions : {df.shape[0]:,} lignes × {df.shape[1]:,} colonnes"
+            )
+            return
+
+        # Duplicats d'identifiant
+        if "doubl" in qq or "duplicate" in qq or ("identifi" in qq and "2 fois" in qq):
+            if id_col not in df.columns:
+                qa_out.error("Je ne trouve pas la colonne identifiant sélectionnée.")
+                return
+            s = df[id_col]
+            dup_mask = s.duplicated(keep=False) & s.notna()
+            n_dup_rows = int(dup_mask.sum())
+            n_dup_ids = int(s[dup_mask].nunique(dropna=True))
+            if n_dup_rows == 0:
+                qa_out.success(f"Aucun doublon détecté dans '{id_col}'.")
+            else:
+                qa_out.warning(
+                    f"Doublons détectés dans '{id_col}' : {n_dup_ids} identifiant(s) dupliqué(s), "
+                    f"touchant {n_dup_rows} ligne(s)."
+                )
+                sample_ids = s[dup_mask].astype("string").dropna().unique()[:10]
+                qa_out.write("Exemples d'identifiants dupliqués :")
+                qa_out.write(list(sample_ids))
+            return
+
+        # Valeurs manquantes
+        if "manquant" in qq or "missing" in qq or "na" in qq:
+            na_counts = df.isna().sum().sort_values(ascending=False)
+            top = na_counts[na_counts > 0].head(20)
+            if top.empty:
+                qa_out.success("Aucune valeur manquante détectée.")
+            else:
+                qa_out.warning("Colonnes avec des valeurs manquantes (top 20) :")
+                qa_out.dataframe(top.to_frame(name="NA"))
+            return
+
+        # Valeurs uniques
+        if "unique" in qq or "distinct" in qq:
+            if id_col in df.columns:
+                n_unique = int(df[id_col].nunique(dropna=True))
+                qa_out.success(
+                    f"'{id_col}' contient {n_unique:,} valeur(s) unique(s) (hors NA)."
+                )
+                return
+
+        # Fallback (si clé API dispo)
+        if client:
+            # Je limite l'information envoyée : schéma + aperçu
+            dtypes_txt = df.dtypes.astype(str).to_dict()
+            preview = df.head(20).to_dict(orient="records")
+
+            prompt_qa = f"""Tu es un assistant d'analyse de données.
+Réponds brièvement en français.
+Ne fournis pas de code.
+Si la question demande un identifiant, utilise la colonne fournie.
+
+Question: {question}
+Colonne_identifiant: {id_col}
+dtypes: {dtypes_txt}
+aperçu_20_lignes: {preview}
+"""
+
+            try:
+                resp = client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[{"role": "user", "content": prompt_qa}],
+                    temperature=0,
+                )
+                qa_out.info(resp.choices[0].message.content.strip())
+            except Exception as e:
+                qa_out.error(f"Erreur IA : {e}")
+        else:
+            qa_out.info(
+                "Je ne reconnais pas cette question. Essaie : lignes, colonnes, doublons, valeurs manquantes."
+            )
+
+    if st.button("🤖 Répondre", use_container_width=True):
+        _answer_question(q)
+
+
 # === Standardiser le texte (sans API) ===
 with st.expander("🧹 Standardiser le texte", expanded=False):
     cols_text = _text_columns(df)
@@ -431,4 +538,11 @@ if os.getenv("DATACURE_RUN_TESTS") == "1":
     df_jsonl, t_jsonl = load_data(fake_jsonl)
     assert t_jsonl == "json" and df_jsonl.shape == (2, 2)
 
+    # Test standardisation : styles + acronymes
+    assert _standardize_text_value("  chu  bruxelles ", True, {"CHU"}, "Majuscule à chaque mot") == "CHU Bruxelles"
+    assert _standardize_text_value("abc DEF", False, set(), "Tout en minuscules") == "abc def"
+    assert _standardize_text_value("abc DEF", False, set(), "Tout en MAJUSCULES") == "ABC DEF"
+    assert _standardize_text_value("abc DEF", False, set(), "Commencer par une majuscule") == "Abc def"
+
     st.success("✅ DATACURE_RUN_TESTS: tous les mini-tests ont réussi")
+
