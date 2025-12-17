@@ -426,8 +426,8 @@ if st.session_state.get("uploaded_name") != uploaded_name:
 
 _ensure_state()
 
-df = st.session_state["df"]
-file_type = st.session_state.get("file_type", file_type_in)
+df = st.session_state.get("df")
+file_type = st.session_state.get("file_type", "inconnu")
 
 
 # === Aperçu ===
@@ -444,11 +444,11 @@ mode = st.radio(
     key="mode",
 )
 
-# --- Typage manuel (override) : visible dans les 2 modes ---
+# --- Typage manuel (override) + value labels : visible dans les 2 modes ---
 with st.expander("🏷️ Labellisation des variables (Catégorielle vs Continue)", expanded=False):
-    st.caption("Force le type pour les variables numériques catégorielles (ou toute variable).")
+    st.caption("Force le type pour les variables numériques catégorielles et ajoute des labels aux modalités.")
 
-    # candidats (numériques uniquement)
+    # candidats (numériques uniquement) pour le typage
     candidates = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
 
     if not candidates:
@@ -515,6 +515,85 @@ with st.expander("🏷️ Labellisation des variables (Catégorielle vs Continue
                 st.success("Overrides supprimés.")
                 st.rerun()
 
+    # =========================
+    # Value labels (modalités)
+    # =========================
+    st.divider()
+    st.markdown("### 🏷️ Nommer les valeurs (modalités) d’une variable catégorielle")
+
+    label_col = st.selectbox(
+        "Variable à labelliser",
+        options=[str(c) for c in df.columns],
+        key="vl_col",
+    )
+
+    s = df[label_col]
+
+    # Limite pour éviter une table énorme
+    n_unique = int(s.nunique(dropna=True))
+    max_modalities = 200
+    if n_unique > max_modalities:
+        st.warning(f"⚠️ {label_col} a {n_unique} valeurs uniques. Affichage limité aux {max_modalities} plus fréquentes.")
+
+    # Modalités (top par fréquence)
+    vals = (
+        s.dropna()
+        .astype("string")
+        .value_counts()
+        .head(max_modalities)
+        .index
+        .tolist()
+    )
+
+    existing = st.session_state.get("value_labels", {}).get(label_col, {})
+    vl_df = pd.DataFrame(
+        {
+            "value": vals,
+            "label": [existing.get(v, "") for v in vals],
+        }
+    )
+
+    edited = st.data_editor(
+        vl_df,
+        use_container_width=True,
+        num_rows="fixed",
+        key="vl_editor",
+    )
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        if st.button("✅ Enregistrer les labels", use_container_width=True, key="vl_save"):
+            mapping = {}
+            for _, r in edited.iterrows():
+                v = str(r["value"])
+                lab = str(r["label"]).strip()
+                if lab:
+                    mapping[v] = lab
+
+            st.session_state.setdefault("value_labels", {})
+            st.session_state["value_labels"][label_col] = mapping
+            st.success(f"Labels enregistrés pour {label_col} ({len(mapping)} valeur(s)).")
+
+    with c2:
+        if st.button("🧾 Appliquer au dataset", use_container_width=True, key="vl_apply"):
+            mapping = st.session_state.get("value_labels", {}).get(label_col, {})
+            if not mapping:
+                st.warning("Aucun label enregistré pour cette variable.")
+            else:
+                df2 = st.session_state["df"].copy()
+                new_col = f"{label_col}_label"
+                base = df2[label_col].astype("string")
+                df2[new_col] = base.map(mapping).fillna(base)
+                st.session_state["df"] = df2
+                st.success(f"Colonne créée : {new_col}")
+                st.rerun()
+
+    with c3:
+        if st.button("🗑️ Supprimer ces labels", use_container_width=True, key="vl_clear"):
+            st.session_state.get("value_labels", {}).pop(label_col, None)
+            st.success(f"Labels supprimés pour {label_col}.")
+            st.rerun()
 
 # ================================
 # 🧭 MODE MÉTHODOLOGIQUE (simple)
@@ -1126,5 +1205,3 @@ if os.getenv("DATACURE_RUN_TESTS") == "1":
     assert _detect_special_codes(s)[0][0] == "99"
 
     st.success("✅ DATACURE_RUN_TESTS: tous les mini-tests ont réussi")
-
-
