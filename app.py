@@ -146,6 +146,7 @@ def _ensure_state() -> None:
     st.session_state.setdefault("cleaning_log", [])
     st.session_state.setdefault("missing_decisions", {})
     st.session_state.setdefault("missing_processed", set())
+    st.session_state.setdefault("type_overrides", {})  # ✅ AJOUT
 
 
 def _log_event(**kwargs) -> None:
@@ -154,102 +155,10 @@ def _log_event(**kwargs) -> None:
     )
 
 
-def _is_id_like(name: str) -> bool:
-    n = (name or "").strip().lower()
-    # indices très fréquents d'identifiants/codes (à étendre si besoin)
-    return any(
-        k in n
-        for k in [
-            " id",
-            "_id",
-            "id_",
-            "ident",
-            "identifier",
-            "code",
-            "zipcode",
-            "zip",
-            "postal",
-            "post",
-            "phone",
-            "tel",
-            "ssn",
-            "nr",
-            "num",
-        ]
-    )
-
-
-def _coerce_numeric_if_possible(s: pd.Series, min_convert_rate: float = 0.9) -> Optional[pd.Series]:
-    """Si une série objet/string est majoritairement numérique, renvoie une version float, sinon None."""
-    if pd.api.types.is_numeric_dtype(s) or pd.api.types.is_bool_dtype(s) or pd.api.types.is_datetime64_any_dtype(s):
-        return None
-
-    # tentative sur une copie string
-    s_str = s.astype("string")
-    s_num = pd.to_numeric(s_str, errors="coerce")
-    n = int(s.notna().sum())
-    if n == 0:
-        return None
-
-    ok = int(s_num.notna().sum())
-    if (ok / n) >= min_convert_rate:
-        return s_num
-    return None
-
-
-def _infer_semantic_type(s: pd.Series, col_name: str = "") -> str:
-    """Heuristique robuste :
-    - bool/categorical -> Catégorielle
-    - datetime -> Continue
-    - objet/string "numérique" -> évalué comme numérique
-    - numérique : peu de modalités => Catégorielle, sinon Continue
-    - règle spéciale : colonnes id-like => Catégorielle
-    """
-
-    if pd.api.types.is_bool_dtype(s) or str(s.dtype) == "bool":
+def _infer_semantic_type(s: pd.Series) -> str:
+    """Heuristique légère : bool/catégorielle ; num avec peu de modalités => catégorielle sinon continue."""
+    if s.dtype == "bool":
         return "Catégorielle"
-
-    if pd.api.types.is_categorical_dtype(s):
-        return "Catégorielle"
-
-    if pd.api.types.is_datetime64_any_dtype(s):
-        return "Continue"
-
-    # Si la colonne ressemble à un identifiant/codage, on force plutôt "Catégorielle"
-    # (même si elle est numérique et très distincte)
-    if _is_id_like(col_name):
-        return "Catégorielle"
-
-    # Si c'est du texte mais fortement convertible en numérique
-    s_num = _coerce_numeric_if_possible(s)
-    if s_num is not None:
-        s = s_num
-
-    if pd.api.types.is_numeric_dtype(s):
-        s2 = s.dropna()
-        n = int(s2.shape[0])
-        if n == 0:
-            return "Continue"
-
-        nunique = int(s2.nunique(dropna=True))
-
-        # Beaucoup de datasets encodent des catégories en int (0/1/2/...) :
-        # - peu de modalités
-        # - ou proportion faible de modalités
-        if nunique <= 20:
-            return "Catégorielle"
-
-        if (nunique / max(n, 1)) <= 0.05:
-            return "Catégorielle"
-
-        # entiers avec "pas trop" de modalités (ex: échelles 0–100, scores discrets)
-        # → on classe souvent comme catégoriel s'il y a relativement peu de valeurs distinctes.
-        if pd.api.types.is_integer_dtype(s) and nunique <= 200 and (nunique / max(n, 1)) <= 0.20:
-            return "Catégorielle"
-
-        return "Continue"
-
-    return "Catégorielle"
 
     if pd.api.types.is_numeric_dtype(s):
         nunique = int(s.nunique(dropna=True))
@@ -326,14 +235,22 @@ def _truncate(s: str, max_len: int) -> str:
     s = " ".join(s.split())
     return (s[: max_len - 1] + "…") if len(s) > max_len else s
 
-
 def _col_profile(df_: pd.DataFrame, col: str) -> dict:
     s = df_[col]
     n = len(df_)
     na = int(s.isna().sum())
     nunique = int(s.nunique(dropna=True))
 
-    semantic = _infer_semantic_type(s, col)
+    # 1) Détection automatique
+    try:
+        semantic = _infer_semantic_type(s, col)  # si ta fonction accepte (s, col)
+    except TypeError:
+        semantic = _infer_semantic_type(s)       # fallback si elle n'accepte que (s)
+
+    # 2) Override manuel (menu déroulant)
+    override = st.session_state.get("type_overrides", {}).get(col)
+    if override in ("Catégorielle", "Continue"):
+        semantic = override
 
     profile = {
         "column": col,
@@ -527,6 +444,49 @@ mode = st.radio(
     key="mode",
 )
 
+# --- Typage manuel (override) : visible dans les 2 modes ---
+with st.expander("🏷️ Labellisation des variables (Catégorielle vs Continue)", expanded=False):
+    st.caption("Force le type pour les variables numériques catégorielles (ou toute variable).")
+
+    # candidats (tu peux changer la règle si tu veux inclure toutes les colonnes)
+    candidates = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+
+    if not candidates:
+        st.info("Aucune colonne numérique détectée.")
+    else:
+        cols = st.multiselect(
+            "Sélectionne les colonnes à typer",
+            options=[str(c) for c in candidates],
+            default=[],
+            key="type_cols_select",
+        )
+
+        for col in cols:
+            current = st.session_state["type_overrides"].get(col, "Auto (détection)")
+            st.selectbox(
+                f"{col}",
+                ["Auto (détection)", "Catégorielle", "Continue"],
+                index=["Auto (détection)", "Catégorielle", "Continue"].index(current),
+                key=f"type_override__{col}",
+            )
+
+        a, b = st.columns(2)
+        with a:
+            if st.button("✅ Appliquer le typage", use_container_width=True, key="type_apply"):
+                for col in cols:
+                    v = st.session_state.get(f"type_override__{col}", "Auto (détection)")
+                    if v == "Auto (détection)":
+                        st.session_state["type_overrides"].pop(col, None)
+                    else:
+                        st.session_state["type_overrides"][col] = v
+                st.success("Typage enregistré.")
+                st.rerun()
+
+        with b:
+            if st.button("🧹 Effacer tous les overrides", use_container_width=True, key="type_clear"):
+                st.session_state["type_overrides"] = {}
+                st.success("Overrides supprimés.")
+                st.rerun()
 
 # ================================
 # 🧭 MODE MÉTHODOLOGIQUE (simple)
@@ -1138,4 +1098,3 @@ if os.getenv("DATACURE_RUN_TESTS") == "1":
     assert _detect_special_codes(s)[0][0] == "99"
 
     st.success("✅ DATACURE_RUN_TESTS: tous les mini-tests ont réussi")
-
