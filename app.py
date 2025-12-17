@@ -19,6 +19,12 @@ import pandas as pd
 import streamlit as st
 from openai import OpenAI
 
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import cm
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+
 
 # === Configuration Streamlit ===
 st.set_page_config(page_title="Datacure Prototype", layout="wide")
@@ -63,6 +69,7 @@ def _standardize_text_value(
     remove_accents: bool,
     acronyms: set[str],
     style: str,
+    remove_double_spaces: bool = True,
 ) -> object:
     # Je laisse les valeurs manquantes et non-textuelles telles quelles
     if x is None or (isinstance(x, float) and pd.isna(x)):
@@ -73,6 +80,32 @@ def _standardize_text_value(
     s = x.strip()
     if not s:
         return s
+
+    if remove_accents:
+        s = _remove_accents(s)
+
+    # Je supprime les doubles (ou multiples) espaces si demandé
+    if remove_double_spaces:
+        s = " ".join(s.split())
+
+    # J'applique le style demandé
+    if style == "Commencer par une majuscule":
+        s = s.lower().capitalize()
+    elif style == "Tout en MAJUSCULES":
+        s = s.upper()
+    elif style == "Tout en minuscules":
+        s = s.lower()
+    else:
+        # Par défaut : Majuscule à chaque mot
+        s = s.lower().title()
+
+    # Je force les acronymes spécifiés en MAJUSCULES, quel que soit le style
+    if acronyms:
+        tokens = s.split(" ")
+        tokens = [t.upper() if t.upper() in acronyms else t for t in tokens]
+        s = " ".join(tokens)
+
+    return s
 
     if remove_accents:
         s = _remove_accents(s)
@@ -148,6 +181,179 @@ def _reset_to_uploaded_file() -> None:
     df0, ft0 = load_data(uploaded_file)
     st.session_state["df"] = df0
     st.session_state["file_type"] = ft0
+
+
+def _col_profile(df_: pd.DataFrame, col: str) -> dict:
+    s = df_[col]
+    n = len(df_)
+    na = int(s.isna().sum())
+    nunique = int(s.nunique(dropna=True))
+    dtype = str(s.dtype)
+
+    profile = {
+        "column": col,
+        "dtype": dtype,
+        "missing": na,
+        "missing_pct": round((na / n * 100) if n else 0.0, 2),
+        "unique": nunique,
+    }
+
+    # Exemples / top valeurs
+    try:
+        vc = s.value_counts(dropna=True)
+        top_vals = [str(v) for v in vc.head(5).index.tolist()]
+    except Exception:
+        top_vals = []
+    profile["examples"] = ", ".join(top_vals)
+
+    # Stats numériques
+    if pd.api.types.is_numeric_dtype(s):
+        profile["min"] = float(s.min(skipna=True)) if s.notna().any() else None
+        profile["max"] = float(s.max(skipna=True)) if s.notna().any() else None
+        profile["mean"] = float(s.mean(skipna=True)) if s.notna().any() else None
+        profile["median"] = float(s.median(skipna=True)) if s.notna().any() else None
+    else:
+        profile["min"] = profile["max"] = profile["mean"] = profile["median"] = None
+
+    return profile
+
+
+def _make_codebook_pdf(df_: pd.DataFrame, dataset_name: str = "Datacure codebook") -> bytes:
+    styles = getSampleStyleSheet()
+    story = []
+
+    story.append(Paragraph(dataset_name, styles["Title"]))
+    story.append(Spacer(1, 0.3 * cm))
+
+    # Résumé dataset
+    n_rows, n_cols = df_.shape
+    summary_tbl = Table(
+        [
+            ["Lignes", f"{n_rows:,}"],
+            ["Colonnes", f"{n_cols:,}"],
+        ],
+        colWidths=[5 * cm, 10 * cm],
+    )
+    summary_tbl.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
+                ("FONTSIZE", (0, 0), (-1, -1), 9),
+            ]
+        )
+    )
+    story.append(summary_tbl)
+    story.append(Spacer(1, 0.4 * cm))
+
+    story.append(Paragraph("Dictionnaire des variables", styles["Heading2"]))
+    story.append(Spacer(1, 0.2 * cm))
+
+    # Profil par colonne
+    rows = [[
+        "Variable",
+        "Type",
+        "Manquants",
+        "%",
+        "Uniques",
+        "Exemples (top 5)",
+        "Min",
+        "Max",
+        "Moy.",
+        "Med.",
+    ]]
+
+    for col in df_.columns:
+        p = _col_profile(df_, str(col))
+        rows.append(
+            [
+                p["column"],
+                p["dtype"],
+                str(p["missing"]),
+                str(p["missing_pct"]),
+                str(p["unique"]),
+                p["examples"],
+                "" if p["min"] is None else f"{p['min']:.4g}",
+                "" if p["max"] is None else f"{p['max']:.4g}",
+                "" if p["mean"] is None else f"{p['mean']:.4g}",
+                "" if p["median"] is None else f"{p['median']:.4g}",
+            ]
+        )
+
+        # Pagination simple : toutes les ~25 variables, je coupe
+        if (len(rows) - 1) % 25 == 0 and (len(rows) - 1) != 0:
+            tbl = Table(
+                rows,
+                colWidths=[
+                    4.0 * cm,
+                    2.0 * cm,
+                    1.6 * cm,
+                    1.2 * cm,
+                    1.4 * cm,
+                    6.0 * cm,
+                    1.2 * cm,
+                    1.2 * cm,
+                    1.2 * cm,
+                    1.2 * cm,
+                ],
+                repeatRows=1,
+            )
+            tbl.setStyle(
+                TableStyle(
+                    [
+                        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                        ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                        ("FONTSIZE", (0, 0), (-1, -1), 8),
+                    ]
+                )
+            )
+            story.append(tbl)
+            story.append(PageBreak())
+            rows = [rows[0]]
+
+    # Dernière table
+    tbl = Table(
+        rows,
+        colWidths=[
+            4.0 * cm,
+            2.0 * cm,
+            1.6 * cm,
+            1.2 * cm,
+            1.4 * cm,
+            6.0 * cm,
+            1.2 * cm,
+            1.2 * cm,
+            1.2 * cm,
+            1.2 * cm,
+        ],
+        repeatRows=1,
+    )
+    tbl.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ]
+        )
+    )
+    story.append(tbl)
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=A4,
+        leftMargin=1.2 * cm,
+        rightMargin=1.2 * cm,
+        topMargin=1.2 * cm,
+        bottomMargin=1.2 * cm,
+        title=dataset_name,
+    )
+    doc.build(story)
+    return buf.getvalue()
 
 
 # === Pas de fichier ===
@@ -246,13 +452,30 @@ with st.expander("💬 Poser une question sur le dataset", expanded=False):
                 qa_out.dataframe(top.to_frame(name="NA"))
             return
 
-        # Valeurs uniques
+        # Cas spécial : FI Item ID → je renvoie le nombre d'IDs uniques (hors NA)
+        if "fi item id" in qq or "fi_item_id" in qq or "fi-item id" in qq:
+            col = None
+            # Je tente d'abord une correspondance exacte
+            if "FI Item ID" in df.columns:
+                col = "FI Item ID"
+            else:
+                # Sinon je cherche une correspondance insensible à la casse/espaces
+                norm = {str(c).strip().lower(): c for c in df.columns}
+                col = norm.get("fi item id") or norm.get("fi_item_id") or norm.get("fi-item id")
+
+            if not col:
+                qa_out.error("Je ne trouve pas la colonne 'FI Item ID' dans ce dataset.")
+                return
+
+            n_unique = int(df[col].nunique(dropna=True))
+            qa_out.success(f"'{col}' contient {n_unique:,} identifiant(s) unique(s) (hors NA).")
+            return
+
+        # Valeurs uniques (générique sur la colonne ID sélectionnée)
         if "unique" in qq or "distinct" in qq:
             if id_col in df.columns:
                 n_unique = int(df[id_col].nunique(dropna=True))
-                qa_out.success(
-                    f"'{id_col}' contient {n_unique:,} valeur(s) unique(s) (hors NA)."
-                )
+                qa_out.success(f"'{id_col}' contient {n_unique:,} valeur(s) unique(s) (hors NA).")
                 return
 
         # Fallback (si clé API dispo)
@@ -290,8 +513,13 @@ aperçu_20_lignes: {preview}
         _answer_question(q)
 
 
-# === Standardiser le texte (sans API) ===
-with st.expander("🧹 Standardiser le texte", expanded=False):
+# === Commandes rapides (sans API) ===
+with st.expander("⚡ Commandes rapides", expanded=False):
+    st.caption("Actions one-click pour nettoyer sans passer par l'API")
+
+    # --- Standardiser le texte ---
+    st.markdown("### 🧹 Standardiser le texte")
+
     cols_text = _text_columns(df)
 
     style = st.selectbox(
@@ -303,12 +531,16 @@ with st.expander("🧹 Standardiser le texte", expanded=False):
             "Tout en minuscules",
         ],
         index=0,
+        key="std_style",
     )
 
-    remove_acc = st.checkbox("Supprimer les accents", value=True)
+    remove_acc = st.checkbox("Supprimer les accents", value=True, key="std_acc")
+    remove_double_spaces = st.checkbox("Supprimer les doubles espaces", value=True, key="std_spaces")
+
     acronyms_raw = st.text_input(
         "Acronymes à garder en MAJ (séparés par des virgules)",
         value="",
+        key="std_acronyms",
     )
     acronyms = {a.strip().upper() for a in acronyms_raw.split(",") if a.strip()}
 
@@ -316,12 +548,13 @@ with st.expander("🧹 Standardiser le texte", expanded=False):
         "Appliquer sur",
         ["Tout le tableau", "Une colonne", "Une ligne"],
         horizontal=True,
+        key="std_scope",
     )
 
     selected_col: Optional[str] = None
     if scope == "Une colonne":
         if cols_text:
-            selected_col = st.selectbox("Colonne", cols_text)
+            selected_col = st.selectbox("Colonne", cols_text, key="std_col")
         else:
             st.info("Aucune colonne texte détectée.")
 
@@ -334,32 +567,41 @@ with st.expander("🧹 Standardiser le texte", expanded=False):
                 max_value=max(0, len(df) - 1),
                 value=0,
                 step=1,
+                key="std_row",
             )
         )
 
     c1, c2, c3 = st.columns(3)
 
     with c1:
-        if st.button("✨ Standardiser", use_container_width=True):
+        if st.button("✨ Standardiser", use_container_width=True, key="std_apply"):
             if not cols_text:
                 st.warning("Je n'ai trouvé aucune colonne texte à standardiser.")
             else:
                 if scope == "Tout le tableau":
                     for c in cols_text:
                         df[c] = df[c].apply(
-                            lambda v: _standardize_text_value(v, remove_acc, acronyms, style)
+                            lambda v: _standardize_text_value(
+                                v, remove_acc, acronyms, style, remove_double_spaces
+                            )
                         )
 
                 elif scope == "Une colonne" and selected_col:
                     df[selected_col] = df[selected_col].apply(
-                        lambda v: _standardize_text_value(v, remove_acc, acronyms, style)
+                        lambda v: _standardize_text_value(
+                            v, remove_acc, acronyms, style, remove_double_spaces
+                        )
                     )
 
                 elif scope == "Une ligne" and selected_row is not None:
                     r = selected_row
                     for c in cols_text:
                         df.at[df.index[r], c] = _standardize_text_value(
-                            df.at[df.index[r], c], remove_acc, acronyms, style
+                            df.at[df.index[r], c],
+                            remove_acc,
+                            acronyms,
+                            style,
+                            remove_double_spaces,
                         )
 
                 st.session_state["df"] = df
@@ -367,7 +609,7 @@ with st.expander("🧹 Standardiser le texte", expanded=False):
                 st.rerun()
 
     with c2:
-        if st.button("↩️ Annuler les changements", use_container_width=True):
+        if st.button("↩️ Annuler les changements", use_container_width=True, key="std_reset"):
             _reset_to_uploaded_file()
             st.success("✅ Réinitialisé")
             st.rerun()
@@ -375,14 +617,65 @@ with st.expander("🧹 Standardiser le texte", expanded=False):
     preview_ph = st.empty()
 
     with c3:
-        if st.button("👀 Voir un aperçu", use_container_width=True):
+        if st.button("👀 Voir un aperçu", use_container_width=True, key="std_preview"):
             st.session_state["show_std_preview"] = True
 
     if st.session_state.get("show_std_preview"):
         preview_ph.dataframe(st.session_state["df"].head())
 
+    st.divider()
 
-# === Commandes rapides (sans API) ===
+    # --- Suppression des valeurs manquantes ---
+    st.markdown("### 🧽 Supprimer les lignes avec valeurs manquantes")
+
+    missing_scope = st.radio(
+        "Mode",
+        [
+            "N'importe quelle colonne (drop si au moins 1 NA)",
+            "Une colonne",
+            "Plusieurs colonnes",
+        ],
+        horizontal=False,
+        key="na_scope",
+    )
+
+    cols_all = list(df.columns)
+    col_one: Optional[str] = None
+    cols_many: list[str] = []
+
+    if missing_scope == "Une colonne":
+        col_one = st.selectbox("Choisir la colonne", cols_all, key="na_one")
+
+    if missing_scope == "Plusieurs colonnes":
+        cols_many = st.multiselect("Choisir les colonnes", cols_all, key="na_many")
+
+    m1, m2 = st.columns(2)
+
+    with m1:
+        if st.button("🧽 Supprimer", use_container_width=True, key="na_apply"):
+            before = len(df)
+
+            if missing_scope == "N'importe quelle colonne (drop si au moins 1 NA)":
+                df = df.dropna(axis=0, how="any")
+
+            elif missing_scope == "Une colonne" and col_one:
+                df = df.dropna(subset=[col_one], how="any")
+
+            elif missing_scope == "Plusieurs colonnes" and cols_many:
+                df = df.dropna(subset=cols_many, how="any")
+
+            st.session_state["df"] = df
+            removed = before - len(df)
+            st.success(f"✅ {removed} ligne(s) supprimée(s)")
+            st.rerun()
+
+    with m2:
+        if st.button("📊 Compter les valeurs manquantes", use_container_width=True, key="na_count"):
+            na_counts = df.isna().sum().sort_values(ascending=False)
+            st.dataframe(na_counts.to_frame(name="NA").T)
+
+
+# === Commande en langage naturel (API) ===
 with st.expander("⚡ Commandes rapides", expanded=False):
     st.caption("Actions one-click pour nettoyer sans passer par l'API")
 
@@ -489,6 +782,27 @@ Contraintes:
 
             except Exception as e:
                 result_container.error(f"❌ Erreur pendant l'exécution du code : {e}")
+
+
+# === Codebook PDF (automatique) ===
+with st.expander("📄 Codebook (PDF)", expanded=False):
+    st.caption("Génère automatiquement un codebook (dictionnaire des variables) à partir du dataset courant.")
+
+    default_name = st.session_state.get("uploaded_name") or "dataset"
+    pdf_title = st.text_input("Titre du codebook", value=f"Codebook - {default_name}")
+
+    if st.button("📄 Générer le PDF", use_container_width=True):
+        try:
+            with st.spinner("Génération du codebook PDF..."):
+                pdf_bytes = _make_codebook_pdf(st.session_state["df"], dataset_name=pdf_title)
+            st.download_button(
+                label="⬇️ Télécharger le codebook (PDF)",
+                data=pdf_bytes,
+                file_name="codebook.pdf",
+                mime="application/pdf",
+            )
+        except Exception as e:
+            st.error(f"Erreur lors de la génération du PDF : {e}")
 
 
 # === Téléchargement ===
