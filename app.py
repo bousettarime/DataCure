@@ -1127,3 +1127,4 @@ if os.getenv("DATACURE_RUN_TESTS") == "1":
 
     st.success("✅ DATACURE_RUN_TESTS: tous les mini-tests ont réussi")
 
+
